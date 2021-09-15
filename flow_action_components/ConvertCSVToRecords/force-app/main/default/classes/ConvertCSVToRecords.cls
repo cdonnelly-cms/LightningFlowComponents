@@ -1,74 +1,242 @@
 public with sharing class ConvertCSVToRecords {
+
+    // * Constants ---------------------------------------------------
+    static final String COMMA_REPL = '~`~';
+    static final String NEW_LINE_REPL = '-`-';
+
+
+    // * Exceptions ---------------------------------------------------
+    public class ParameterException extends Exception { }
+    public class StateException extends Exception { }
+
+    @testVisible static String toExceptionMessageInvalidApiFieldName(string rawName, string apiName, string sObjName) { return string.format('The rawFieldName [{0}], which was converted to [{1}], is not a valid API field name for the SObject {2}', new List<string> { rawName, apiName, sObjName }); }
+
+    @testVisible static final string EXCEPTION_CONTENT_DOC_ID_AND_LIST_NOT_SUPPLIED = 'You need to provide either a single ContentDocument Id OR a list of ContentDocumentIds as inputs to this Flow action.';
+
+
+    // * Invocable Method ---------------------------------------------
     @InvocableMethod(label='Convert CSV File to Records from single or multiple ContentDocumentIds')
     public static Response[] convert(Request[] inputs) {
         Response[] responseList = new List<Response>{};
-
-        for (Request curInput : inputs) {
-            if (curInput.contentDocumentId == null && curInput.contentDocumentIdList == null) {
-                throw new FlowCustomException('You need to provide either a single ContentDocument Id OR a list of ContentDocumentIds as inputs to this Flow action.');
-            } else {
-                // Easiest to just combine the inputs for processing
-                if (curInput.contentDocumentId != null) {
-                    if(curInput.contentDocumentIdList == null) {
-                        curInput.contentDocumentIdList = new List<String>();
-                    }
-                    curInput.contentDocumentIdList.add(curInput.contentDocumentId);
-                }
+        for (Request input : inputs) {
+            if (input.contentDocumentId == null && (input.contentDocumentIdList == null || input.contentDocumentIdList.size() == 0)) {
+                throw new ParameterException(EXCEPTION_CONTENT_DOC_ID_AND_LIST_NOT_SUPPLIED);
             }
-            for (String curContentDocumentId : curInput.contentDocumentIdList) {
-                SObjectType sObjType = ((SObject) Type.forName(curInput.objectApiName).newInstance()).getSObjectType();
-                Map<String, SObjectField> fieldMap = sObjType.getDescribe().fields.getMap();
-
-                Blob csvBlobContent = getCsvContent(curContentDocumentId);
-                String csvStringContent = blobToString(csvBlobContent, 'ISO-8859-1');
-                String commaRepl = '~`~', newlineRepl = '-`-';
-                csvStringContent = csvStringContent.replaceAll('(\r\n|\r)', '\n');
-                csvStringContent = removeCommas(csvStringContent, 0, commaRepl, newlineRepl);
-                String[] csvRows = csvStringContent.split('\n');
-                String[] fields = csvRows[0].split(curInput.FSep); //Gives all the API names of the fields from the 1st CSV row 
-                csvRows.remove(0);
-                Map<String, Schema.DisplayType> fieldToFieldTypeMap = new Map<String, Schema.DisplayType>();
-                Map<String, String> fieldName = new Map<String, String>();
-                for (String field : fields) {
-                    String fieldApiName = field.trim(); //Since fieldnames will never contain spaces, we will always trim
-                    if (fieldMap.get(fieldApiName) == null) {
-                        fieldApiName = fieldApiName.replaceAll('/', '_');
-                        fieldApiName = fieldApiName.replaceAll(' ', '_').replaceAll('[^a-zA-Z0-9_]', ''); // Convert to alphanumeric and underscore
-                        fieldApiName = fieldApiName.replaceAll('__', '_') + '__c'; // Remove extra _s and add __c to end
-                    }
-                    fieldToFieldTypeMap.put(field, getFieldType(fieldMap, fieldApiName));
-                    fieldName.put(field, fieldApiName);
-                }
-
-                Response output = new Response();
-                output.convertedCSVRows = new List<SObject>{};
-                for (String row : csvRows) {
-                    row = replaceNewline(row, newlineRepl);
-                    SObject obj = sObjType.newSObject();
-                    row = row.replace(curInput.Fsep + '"',curInput.Fsep).replace('"' + curInput.Fsep,curInput.Fsep);
-                    String[] fieldInputValues = row.split(curInput.FSep);
-                    for (Integer i = 0; i < fields.size(); i++) {
-                        String fieldValue = fieldInputValues[i].replace(curInput.Fsep + '"',curInput.Fsep).replace('"' + curInput.Fsep,curInput.Fsep);
-                        String Tsep = curInput.Tsep;
-                        String Dsep = curInput.Dsep;
-                        String vCur = curInput.vCur;
-                        if (curInput.isTrim) {
-                            fieldValue = fieldValue.trim();
-                        }
-                        Schema.DisplayType fieldType = fieldToFieldTypeMap.get(fields[i]);
-                        try {
-                            obj.put( fieldName.get(fields[i]), getConvertedFieldValue(fieldType, fieldValue, Tsep, Dsep, vCur) );
-                        } catch(exception e) {
-                            obj.put( fieldName.get(fields[i]), null );
-                        }
-                    }
-                    output.convertedCSVRows.add(obj);
-                }
-                responseList.add(output);
-            }
+            Response output = process(input);
+            responseList.add(output);
         }
         return responseList;
     }
+
+    private static Response process(Request input) {
+        Id[] contentDocumentIds = new List<Id>(); // Combine contentDocumentIds for processing
+        if (input.contentDocumentId != null)     { contentDocumentIds.add(input.contentDocumentId); }
+        if (input.contentDocumentIdList != null) { contentDocumentIds.addAll(input.contentDocumentIdList); }
+        final string fieldSeparator = (string.isBlank(input.fieldSeparatorOrNull)) ? ',' : input.fieldSeparatorOrNull.trim().left(1); // defaults to comma if not specified
+
+        Response result = new Response();
+        result.convertedCSVRows = new List<SObject>{};
+
+        for (String curContentDocumentId : contentDocumentIds) {
+            Blob csvBlobContent = getCsvContent(curContentDocumentId);
+            String csvStringContent = blobToString(csvBlobContent, 'ISO-8859-1');
+            csvStringContent = csvStringContent.replaceAll('(\r\n|\r)', '\n');
+            csvStringContent = replaceQuotedCommasAndNewLines(csvStringContent, 0, COMMA_REPL, NEW_LINE_REPL);
+            String[] csvRows = csvStringContent.split('\n');
+            String[] rawFieldNames = csvRows[0].split(fieldSeparator); // get names of the fields from the 1st CSV row. Assumes field names do not contain COMMA_REPL
+            csvRows.remove(0);
+            RecordFieldParser recordParser = new RecordFieldParser(input.objectApiName, rawFieldNames, input.thousandsSeparatorOrNull, input.decimalSeparatorOrNull, input.isDateFormatMMDDYYYYOrNull, input.isTrimAlwaysOrNull);
+            
+            for (String row : csvRows) {
+                System.debug(row);
+                row = replaceNewline(row, NEW_LINE_REPL);
+                row = row.replaceAll('^"', ''); // remove field value quote prefixes (start of the row followed by quotation) // TODO followed by optional white space
+                row = row.replaceAll('"$', ''); // remove field value quote suffix (quotation followed by end of the row) // TODO followed by optional white space
+                row = row.replace(fieldSeparator+'"', fieldSeparator); // remove field value quote prefixes (field separator followed by quotation) // TODO followed by optional white space
+                row = row.replace('"'+fieldSeparator, fieldSeparator); // remove field value quote suffix (quotation followed by field separator) // TODO followed by optional white space
+                System.debug(row);
+                String[] fieldValues = row.split(fieldSeparator);
+                SObject record = recordParser.toRecord(fieldValues);
+                // TODO deal with record parsing errors
+                result.convertedCSVRows.add(record);
+            }
+        }
+        return result;
+    }
+
+    // TODO CsvStringParser class 
+
+    // * Sub-class ---------------------------------------------------------------------------
+    @TestVisible
+    private class RecordFieldParser {
+        // -- state
+        final SObjectType sObjType;
+        final string[] rawFieldNames;
+        final String thousandsSeparator;
+        final String decimalSeparator;
+        final boolean isDateFormatMMDDYYYY;
+        final boolean isTrimAlways;
+        
+        final Map<String, String> rawFieldNameToApiNameMap          = new Map<String, String>();
+        final Map<String, Schema.DisplayType> rawNameToFieldTypeMap = new Map<String, Schema.DisplayType>();
+
+        // -- constructor
+        @TestVisible
+        private RecordFieldParser(string objectApiName, string[] rawFieldNames, String thousandsSeparatorOrNull, String decimalSeparatorOrNull, boolean isDateFormatMMDDYYYYorNull, boolean isTrimAlwaysOrNull) {
+            if (string.isBlank(objectApiName)) { throw new ParameterException('Parameter objectApiName in the constructor for RecordFieldParser is blank.'); }
+            if (rawFieldNames == null || rawFieldNames.size() == 0) { throw new ParameterException('Parameter rawFieldNames in the constructor for RecordFieldParser is null or empty.'); }
+            this.rawFieldNames = rawFieldNames;
+            
+            try { this.sObjType = ((SObject)Type.forName(objectApiName.trim()).newInstance()).getSObjectType(); } 
+            catch (Exception e) { throw new ParameterException('Parameter objectApiName in the constructor for RecordFieldParser must be a valid SObject type name, but getting the type name failed with error message '+e.getMessage()); }
+            
+            this.thousandsSeparator   = (string.isBlank(thousandsSeparatorOrNull)) ? ',' : thousandsSeparatorOrNull.trim().left(1); // defaults to comma if not specified
+            this.decimalSeparator     = (string.isBlank(decimalSeparatorOrNull))   ? '.' : decimalSeparatorOrNull.trim().left(1); // defaults to decimal point if not specified
+            // TODO throw if thousandsSeparator == decimalSeparator
+
+            this.isDateFormatMMDDYYYY = (isDateFormatMMDDYYYYorNull == TRUE);
+            this.isTrimAlways         = (isTrimAlwaysOrNull == TRUE);
+
+            Map<String, SObjectField> apiNameToFieldMap = sObjType.getDescribe().fields.getMap();
+            for (String rawFieldName : rawFieldNames) {
+                if (string.isBlank(rawFieldName)) { throw new ParameterException('A rawFieldName in the rawFieldNames list in the constructor for RecordFieldParser is blank.'); }
+                string rawName = rawFieldName.trim();  // Since field names will never have leading or trailing spaces, we will always trim
+                string fieldApiName = toFieldApiName(rawName, apiNameToFieldMap);
+                rawFieldNameToApiNameMap.put(rawName, fieldApiName);
+                Schema.DisplayType fieldType = apiNameToFieldMap.get(fieldApiName).getDescribe().getType();
+                if (fieldType == null) { throw new ParameterException('The field type ['+fieldType+'] for the fieldApiName ['+fieldApiName+'] must not be null.'); } // TODO remove ?
+                rawNameToFieldTypeMap.put(rawName, fieldType);
+            }
+        }
+
+        // -- methods
+        string toFieldApiName(String rawFieldName, Map<String, SObjectField> apiNameToFieldMap) {
+            string result = rawFieldName;
+            if (apiNameToFieldMap.get(result) == null) {
+                result = result.replaceAll('/', '_');
+                result = result.replaceAll(' ', '_').replaceAll('[^a-zA-Z0-9_]', ''); // Convert to alphanumeric and underscore
+                result = result.replaceAll('__', '_') + '__c'; // Remove extra _s and add __c to end
+            }
+            if (apiNameToFieldMap.get(result) == null) { // TODO option to ignore or substitute for an unrecognized field names
+                throw new ParameterException(toExceptionMessageInvalidApiFieldName(rawFieldName, result, sObjType.getDescribe().getName()));
+            }
+            return result;
+        }
+
+        private SObject toRecord(String[] fieldStringValues) { // TODO return ParseRecordResult ()
+            // TODO throw if fieldStringValues null or empty
+            
+            integer countFieldNames = rawFieldNames.size();
+            integer countFieldValues = fieldStringValues.size();
+            // TODO if (fieldStringValues.size() != rawFieldNames.size()) add fieldValueError and abort or continue ?
+
+            SObject record = sObjType.newSObject();
+            for (Integer i = 0; i < countFieldNames; i++) {
+                if (i == countFieldValues) { break; } // exit loop if more field names than values
+                string rawFieldName = rawFieldNames[i];
+                Schema.DisplayType fieldType = rawNameToFieldTypeMap.get(rawFieldName);
+                
+                string valueStringOrNull = fieldStringValues[i]; // TODO check if can be null or always empty string ?
+                if (valueStringOrNull != null) { 
+                    if (isTrimAlways) { valueStringOrNull = valueStringOrNull.trim(); }
+                    valueStringOrNull = replaceComma(valueStringOrNull, COMMA_REPL); // TODO remove
+                }
+
+                try {
+                    record.put( rawFieldNameToApiNameMap.get(rawFieldName), getConvertedFieldValue(fieldType, valueStringOrNull) );
+                } catch(exception e) {
+                    record.put( rawFieldNameToApiNameMap.get(rawFieldName), null );
+                    // TODO add fieldValueError (fieldName, rawData, errorMessage)
+                }
+            }
+            return record; // TODO return ParseRecordResult ()
+        } 
+
+        Object getConvertedFieldValue(Schema.DisplayType fieldType, String valueStringOrNull) {
+            
+
+            if (String.isBlank(valueStringOrNull) && fieldType != Schema.DisplayType.BOOLEAN) {
+                return null;
+            }
+            switch on fieldType { // setting field value based on the field data type
+                when BOOLEAN {
+                    return String.isBlank(valueStringOrNull) // TODO extract and improve
+                        ? false 
+                        : Boolean.valueOf(valueStringOrNull);
+                }
+                when CURRENCY, DOUBLE, INTEGER, LONG { return parseNumber(fieldType, valueStringOrNull); } // TODO add Percent
+                when DATE { return parseDate(valueStringOrNull); }
+
+                // See https://developer.salesforce.com/docs/atlas.en-us.232.0.apexref.meta/apexref/apex_enum_Schema_DisplayType.htm 
+                // and https://developer.salesforce.com/docs/atlas.en-us.234.0.apexcode.meta/apexcode/langCon_apex_primitives.htm
+                // TODO DateTime 
+                // TODO Time
+                // TODO Id
+                // TODO String, Picklist, URL, Email, Phone, TextArea
+                // TODO base64 (Blob)
+            }
+            return valueStringOrNull;
+        }
+
+        @TestVisible
+        object parseNumber(Schema.DisplayType fieldType, string numberString) {
+            string cleaned = toCleanNumberString(numberString);
+            switch on fieldType {
+                when DOUBLE   { return Double.valueOf(cleaned); }
+                when CURRENCY { return Decimal.valueOf(cleaned); }
+                when INTEGER  { return Integer.valueOf(toLeftOfDecimalPoint(cleaned)); }
+                when LONG     { return Long.valueOf(toLeftOfDecimalPoint(cleaned)); }
+                // TODO PERCENT
+            }
+            // TODO throw if fieldType not found
+            return cleaned;
+        }
+
+        @TestVisible
+        Date parseDate(string dateString) {
+            String fValue = dateString.trim().replaceAll('[^0-9]', '-'); /* replace any non digit characters (such as a slash, colon or dot) with a dash e.g. like in 2021.12.31 or 2021/12/31 or 2021:12:31 or 1.1.2021 or 31/12/2021 or 31:12:2021 */
+            list<String> parts = fValue.split('-');
+            if (parts.size() == 3) {
+                Integer year;
+                Integer month;
+                Integer day;
+                If (parts[0].length() == 4 && parts[1].length() <= 2 && parts[2].length() <= 2) { /* assume format is YYYY-MM-DD */
+                    year  = Integer.valueOf(parts[0]);           
+                    month = Integer.valueOf(parts[1]);           
+                    day   = Integer.valueOf(parts[2]);
+                }
+                else if (parts[0].length() <= 2 && parts[1].length() <= 2 && parts[2].length() == 4) { /* assume format is DD-MM-YYYY or MM-DD-YYYY */
+                    day   = (isDateFormatMMDDYYYY == true) ? Integer.valueOf(parts[1]) : Integer.valueOf(parts[0]);           
+                    month = (isDateFormatMMDDYYYY == true) ? Integer.valueOf(parts[0]) : Integer.valueOf(parts[1]);           
+                    year  = Integer.valueOf(parts[2]);
+                }
+                return date.newInstance(year, month, day);
+            }
+            return date.parse(dateString.trim());
+        }
+
+        /** Returns a string containing only digits, a decimal point and optionally a minus sign.
+         *  Thousand separators are removed and any decimal separator that is not a decimal point is converted.
+         */
+        string toCleanNumberString(string numberString) {
+            String clean = numberString.replaceAll('[^0-9,.-]',''); // remove any character that is not a digit, decimal point, comma or minus sign
+            string excludeThousandSep = (clean.indexOf(thousandsSeparator) >= 0)
+                ? clean.replace(thousandsSeparator, '') // remove the thousand separator
+                : clean;
+            return (decimalSeparator != '.' && excludeThousandSep.indexOf(decimalSeparator) >= 0)
+                ? excludeThousandSep.replace(decimalSeparator, '.') // replace the decimal separator with a decimal point
+                : excludeThousandSep;
+        }
+
+        string toLeftOfDecimalPoint(string cleaned) {
+            integer indexOfDecimalPoint = cleaned.indexOf('.'); // NOTE any alternative decimal Separator will have been converted to a decimal point in cleanNumberString()
+            return (indexOfDecimalPoint < 0) 
+                ? cleaned
+                : cleaned.left(indexOfDecimalPoint);
+        }
+    }
+    // ------------------------------------------------------------------------------------------------------------------
+
 
     static Blob getCsvContent(String contentDocumentId) {
         ContentVersion csvFile = [SELECT VersionData FROM ContentVersion WHERE ContentDocumentId = :contentDocumentId AND IsLatest = TRUE];
@@ -88,93 +256,8 @@ public with sharing class ConvertCSVToRecords {
         return EncodingUtil.urlDecode('%' + String.join(bytes, '%'), inCharset);
     }
 
-    @TestVisible
-    static Object getConvertedFieldValue(Schema.DisplayType fieldType, String fieldValue, String Tsep, String Dsep, String vCur){
-        Object convertedFieldValue;
 
-        switch on
-            fieldType { //Setting Field value based on the field data type
-            when BOOLEAN {
-                convertedfieldValue = String.isEmpty(fieldValue) ? false : Boolean.valueOf(fieldValue);
-            }
-            when DOUBLE {
-                String fValue = fieldValue.replaceAll('^0-9,.','');
-                if( fValue.indexOf(Tsep) < 0 && fValue.indexOf(Dsep) < 0 ) {/* both WITHOUT Thousands separator and WITHOUT decimal separator */
-                    /* No conversion needed */
-                    convertedfieldValue = String.isEmpty(fieldValue) ? null : Decimal.valueOf(fValue);
-                    }
-                if( fValue.indexOf(Tsep) < 0 && fValue.indexOf(Dsep) > -1) {/*example: change value WITHOUT thousands separator and WITH decimals like 1.234 (US) or 1,234 (EU) to 1.234 (US)*/
-                    /* Convert comma as decimal separator to point */
-                    convertedfieldValue = String.isEmpty(fieldValue) ? null : Decimal.valueOf(fValue.replace(',','.'));
-                    }
-                if( fValue.indexOf(Tsep) > -1 && fValue.indexOf(Dsep) < 0) {/*example: change value WITH thousands separator and WITHOUT decimals like 1,234 (US) or 1.234 (EU) to 1234 */
-                    /* Remove comma and point as Thousands separator (no decimals present) */
-                    convertedfieldValue = String.isEmpty(fieldValue) ? null : Decimal.valueOf(fValue.replace(',','').replace('.',''));
-                    }
-                if( fValue.indexOf(Tsep) > -1 && fValue.indexOf(Dsep) > -1 && Tsep == ',') {/*example: change value WITH thousand separator and WITH decimals like 1,234.56 to 1234.56 (US) */
-                    /* Remove comma Thousands separator, leave decimal separator unchanged) */
-                    convertedfieldValue = String.isEmpty(fieldValue) ? null : Decimal.valueOf(fValue.replace(',',''));
-                    }
-                if( fValue.indexOf(Tsep) > -1 && fValue.indexOf(Dsep) > -1 && Tsep == '.') {/*example: change value WITH thousand separator and WITH decimals like 1.234,56 to 1234,56 (EU)*/
-                    /* Remove point as Thousands separator, change comma to point as decimal separator */
-                    convertedfieldValue = String.isEmpty(fieldValue) ? null : Decimal.valueOf(fValue = fValue.replace('.','').replace(',','.'));
-                    }
-            }
-            when CURRENCY {
-                String fValue = fieldValue.replaceAll('^0-9,.','').replace(vCur,'').replace(' ','');
-                if( fValue.indexOf(Tsep) < 0 && fValue.indexOf(Dsep) < 0 ) {/* both WITHOUT Thousands separator and WITHOUT decimal separator */
-                    /* No conversion needed */
-                    convertedfieldValue = String.isEmpty(fieldValue) ? null : Decimal.valueOf(fValue);
-                    }
-                if( fValue.indexOf(Tsep) < 0 && fValue.indexOf(Dsep) > -1) {/*example: change value WITHOUT thousands separator and WITH decimals like 1.234 (US) or 1,234 (EU) to 1.234 (US)*/
-                    /* Convert comma as decimal separator to point */
-                    convertedfieldValue = String.isEmpty(fieldValue) ? null : Decimal.valueOf(fValue.replace(',','.'));
-                    }
-                if( fValue.indexOf(Tsep) > -1 && fValue.indexOf(Dsep) < 0) {/*example: change value WITH thousands separator and WITHOUT decimals like 1,234 (US) or 1.234 (EU) to 1234 */
-                    /* Remove comma and point as Thousands separator (no decimals present) */
-                    convertedfieldValue = String.isEmpty(fieldValue) ? null : Decimal.valueOf(fValue.replace(',','').replace('.',''));
-                    }
-                if( fValue.indexOf(Tsep) > -1 && fValue.indexOf(Dsep) > -1 && Tsep == ',') {/*example: change value WITH thousand separator and WITH decimals like 1,234.56 to 1234.56 (US) */
-                    /* Remove comma Thousands separator, leave decimal separator unchanged) */
-                    convertedfieldValue = String.isEmpty(fieldValue) ? null : Decimal.valueOf(fValue.replace(',',''));
-                    }
-                if( fValue.indexOf(Tsep) > -1 && fValue.indexOf(Dsep) > -1 && Tsep == '.') {/*example: change value WITH thousand separator and WITH decimals like 1.234,56 to 1234,56 (EU)*/
-                    /* Remove point as Thousands separator, change comma to point as decimal separator */
-                    convertedfieldValue = String.isEmpty(fieldValue) ? null : Decimal.valueOf(fValue = fValue.replace('.','').replace(',','.'));
-                    }
-            }
-            when INTEGER {
-                /*Remove thousands separator ( , and . like in 1,234 and 1.234 ) */
-                convertedfieldValue = String.isEmpty(fieldValue) ? null : Integer.valueOf(fieldValue.replaceAll('^0-9',''));
-            }
-            when DATE {
-                /* replace / and : and . in fieldvalue by -  like in 2021.12.31 or 2021/12/31 or 2021:12:31 or 1.1.2021 or 31/12/2021 or 31:12:2021 */
-                String fValue = fieldValue.replaceAll('^0-9','-');
-                list<String> lstSplit = fValue.split('-');
-                If (fValue.indexOf('-') > 2){
-                   /* Format found like YYYY-MM-DD */
-                   Integer Year = Integer.valueOf(lstSplit[0]);           
-                   Integer Month = Integer.valueOf(lstSplit[1]);           
-                   Integer Day = Integer.valueOf(lstSplit[2]);
-                   convertedfieldValue = String.isEmpty(fieldValue) ? null : date.valueOf(Year + '-' + ('0' + Month).Right(2) + '-' + ('0' + Day).Right(2));
-                   }
-                else {
-                   /* Format found like DD-MM-YYYY, convert to YYYY-MM-DD */
-                   Integer Day = Integer.valueOf(lstSplit[0]);           
-                   Integer Month = Integer.valueOf(lstSplit[1]);           
-                   Integer Year = Integer.valueOf(lstSplit[2]);
-                   convertedfieldValue = String.isEmpty(fieldValue) ? null : date.valueOf(Year + '-' + ('0' + Month).Right(2) + '-' + ('0' + Day).Right(2));
-                   }                      
-            }
-            when else {
-                convertedfieldValue = fieldValue;
-            }
-        }
-
-        return convertedFieldValue;
-    }
-
-    static String removeCommas(String text, Integer eloc, String commaRepl, String newlineRepl) {
+    static String replaceQuotedCommasAndNewLines(String text, Integer eloc, String commaRepl, String newlineRepl) { // TODO fix: does not consider alternate field separator
         Integer sloc = -1;
         if (eloc == 0 && text.substring(eloc, 1) == '"') {
             sloc = 0;
@@ -194,7 +277,7 @@ public with sharing class ConvertCSVToRecords {
         }
         String subText = text.substring(sloc + 1, eloc).replace(',', commaRepl).replace('\n', newlineRepl);
         String replText = text.substring(0, sloc + 1) + subText + text.substring(eloc);
-        return removeCommas(replText, eloc, commaRepl, newlineRepl);
+        return replaceQuotedCommasAndNewLines(replText, eloc, commaRepl, newlineRepl);
     }
 
     static Integer getNextQuoteIndex(String text, Integer startingFrom, Boolean isClosing) {
@@ -224,48 +307,41 @@ public with sharing class ConvertCSVToRecords {
         return text.removeStart('\"').removeEnd('\"').replace('""', '"'); //according to spec "" stands for a single " within a column.
     }
 
-    @TestVisible
-    static Schema.DisplayType getFieldType(Map<String, SObjectField> fieldMap, String fieldApiName) {
-        if (fieldMap.get(fieldApiName) == null) {
-            throw new FlowCustomException('Invalid Field Error: ' + fieldApiName + '. Please double check the API name of the field.');
-        }
-        return fieldMap.get(fieldApiName).getDescribe().getType();
-    }
 
-    public class FlowCustomException extends Exception {
-    }
-
+    // * Invocable Request Class ---------------------------------------------------------------------------
     public class Request {
-        public Request() {
-        }
+        public Request() { }
 
         @InvocableVariable(label='Object API Name' required=true)
         public string objectApiName;
 
-        @InvocableVariable(label='Separator 1: Fields' description='Choose comma (input: , ) or semicolon (input: ; )' required=true)
-        public string FSep;
-
-        @InvocableVariable(label='Separator 2: Decimals' description='Choose comma (input: , ) or semicolon (input: ; )' required=true)
-        public string DSep;
-
-        @InvocableVariable(label='Separator 3: Thousands' description='Choose comma (input: , ) or semicolon (input: ; )' required=true)
-        public string TSep;
-        
-        @InvocableVariable(label='Symbol of Currency' description='Like $, €, £' required=true)
-        public string vCur;
-        
         @InvocableVariable(label='CSV (single) File ID')
         public string contentDocumentId;
 
-        @InvocableVariable(label='CSV List of File IDs')
+        @InvocableVariable(label='List of CSV File IDs')
         public List<String> contentDocumentIdList;
 
-        @InvocableVariable(label='Trim leading and trailing spaces')
-        public Boolean isTrim = false;
+        @InvocableVariable(label='Field Separator' description='Specify the CSV field separator (e.g. semicolon [input: ; ]) or leave blank for the default which is a comma [,]')
+        public string fieldSeparatorOrNull;
+
+        @InvocableVariable(label='Thousands Separator' description='Specify the thousands separator (e.g. semicolon [input: ; ]) or leave blank for the default which is a comma [,]')
+        public string thousandsSeparatorOrNull;
+
+        @InvocableVariable(label='Decimal Separator' description='Specify the decimal separator (e.g. semicolon [input: ; ]) or leave blank for the default which is a decimal point [.]')
+        public string decimalSeparatorOrNull;
+
+        @InvocableVariable(label='Is Date Format MM/DD/YYYY' description='Specify if using the American Date Format (e.g 12/31/2021 [input: TRUE ]), otherwise leave blank for the default formats of DD/MM/YYYY or YYYY-MM-DD')
+        public boolean isDateFormatMMDDYYYYOrNull;
+
+        @InvocableVariable(label='Is Trim Field Values' description='Specify if leading and trailing spaces should be trimmed on all field values should be trimmed [input: TRUE ], otherwise leave blank for the default of [FALSE]')
+        public Boolean isTrimAlwaysOrNull;
     }
 
+    // * Invocable Response Class ---------------------------------------------------------------------------
     public class Response {
         @InvocableVariable(label='List(collection) of Records')
         public List<SObject> convertedCSVRows;
+
+        // TODO include errorRows and errorDetails
     }
 }
